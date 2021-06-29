@@ -1,0 +1,210 @@
+#include "argsParser.h"
+#include "buffers.h"
+#include "common.h"
+#include "logger.h"
+
+#include "NvCaffeParser.h"
+#include "NvInfer.h"
+#include <iostream>
+#include <fstream>
+#include <NvInfer.h>
+#include <memory>
+#include <NvOnnxParser.h>
+#include <vector>
+#include <cuda_runtime_api.h>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudawarping.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <algorithm>
+#include <numeric>
+#include <filesystem>
+
+
+// destroy TensorRT objects if something goes wrong
+struct TRTDestroy
+{
+	template <class T>
+	void operator()(T* obj) const
+	{
+		if (obj)
+		{
+			obj->destroy();
+		}
+	}
+};
+
+template <class T>
+using TRTUniquePtr = std::unique_ptr<T, TRTDestroy>;
+
+// calculate size of tensor
+size_t getSizeByDim(const nvinfer1::Dims& dims)
+{
+	size_t size = 1;
+	for (size_t i = 0; i < dims.nbDims; ++i)
+	{
+		size *= dims.d[i];
+	}
+	return size;
+}
+
+template <typename T>
+struct TrtDestroyer {
+	void operator()(T* t) { t->destroy(); }
+};
+template <typename T>
+using SampleUniquePtr = std::unique_ptr<T, samplesCommon::InferDeleter>;
+
+template <typename T>
+SampleUniquePtr<T> makeUnique(T* t)
+{
+	return SampleUniquePtr<T>{t};
+}
+
+template <typename T> using TrtUniquePtr = std::unique_ptr<T, TrtDestroyer<T> >;
+
+
+// preprocessing stage ------------------------------------------------------------------------------------------------
+void preprocessImage(const std::string& image_path, float* gpu_input, const nvinfer1::Dims& dims)
+{
+	// read input image
+	cv::Mat frame = cv::imread(image_path);
+	if (frame.empty())
+	{
+		std::cerr << "Input image " << image_path << " load failed\n";
+		return;
+	}
+
+	cv::Scalar mean, stddev;
+	cv::meanStdDev(frame, mean, stddev);
+
+	cv::cuda::GpuMat gpu_frame;
+	// upload image to GPU
+	gpu_frame.upload(frame);
+
+	auto input_width = dims.d[3];
+	auto input_height = dims.d[2];
+	auto channels = dims.d[1];
+	auto input_size = cv::Size(input_width, input_height);
+	// normalize
+	cv::cuda::GpuMat flt_image;
+	gpu_frame.convertTo(flt_image, CV_32FC3, 1.f / 255.f);
+	// to tensor
+	std::vector<cv::cuda::GpuMat> chw;
+	for (size_t i = 0; i < channels; ++i)
+	{
+		chw.emplace_back(cv::cuda::GpuMat(input_size, CV_32FC1, gpu_input + i * input_width * input_height));
+	}
+	cv::cuda::split(flt_image, chw);
+}
+
+// post-processing stage ----------------------------------------------------------------------------------------------
+void postprocessResults(float* gpu_output, const nvinfer1::Dims& dims, int batch_size, std::string fileName)
+{
+	// copy results from GPU to CPU
+	std::vector<float> cpu_output(getSizeByDim(dims) * batch_size);
+	cudaMemcpy(cpu_output.data(), gpu_output, cpu_output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+
+	cv::Mat obj1(512, 512, CV_32FC1, &cpu_output[0]);
+	cv::Mat obj2(512, 512, CV_32FC1, &cpu_output[512 * 512]);
+
+	cv::Mat obj3(512, 512, CV_8UC1, cv::Scalar(0));
+
+	for (int ii = 0; ii < 512 * 512; ii++) {
+		if (cpu_output[ii] >= cpu_output[ii + (512 * 512)]) {
+			obj3.at<uchar>(ii) = 0;
+		}
+		else {
+			obj3.at<uchar>(ii) = 255;
+		}
+	}
+	cv::imwrite(fileName, obj3);
+}
+
+SampleUniquePtr<nvinfer1::ICudaEngine> getEngine(const std::string& engine, int DLACore, std::ostream& err) {
+	std::ifstream engineFile(engine, std::ios::binary);
+	if (!engineFile)
+	{
+		err << "Error opening engine file: " << engine << std::endl;
+		return nullptr;
+	}
+
+	engineFile.seekg(0, engineFile.end);
+	long int fsize = engineFile.tellg();
+	engineFile.seekg(0, engineFile.beg);
+
+	std::vector<char> engineData(fsize);
+	engineFile.read(engineData.data(), fsize);
+	if (!engineFile)
+	{
+		err << "Error loading engine file: " << engine << std::endl;
+		return nullptr;
+	}
+	TrtUniquePtr<nvinfer1::IRuntime> runtime{ createInferRuntime(sample::gLogger.getTRTLogger()) };
+	if (DLACore != -1)
+	{
+		runtime->setDLACore(DLACore);
+	}
+	auto temp = runtime->deserializeCudaEngine(engineData.data(), fsize, nullptr);
+	return SampleUniquePtr<nvinfer1::ICudaEngine>(temp, samplesCommon::InferDeleter());
+}
+
+
+// main pipeline ------------------------------------------------------------------------------------------------------
+int main(int argc, char* argv[])
+{
+	std::string image_path = "D:/TensorRt/artefact_model_10x/model2/TRT_Output/1.png";
+	std::string enginePath = "D:/TensorRt/artefact_model_10x/model2/TRT_Engine/Model.engine";
+	std::string out_String = "D:/TensorRt/artefact_model_10x/model2/TRT_Output/1_Out.png";
+
+	auto mEngine = getEngine(enginePath, -1, std::cerr);
+	if (!mEngine) {
+		return false;
+	}
+
+	auto mContext = SampleUniquePtr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+	if (!mContext) {
+		return false;
+	}
+
+	int batch_size = 1;
+
+	// get sizes of input and output and allocate memory required for input data and for output data
+	std::vector<nvinfer1::Dims> input_dims; // we expect only one input
+	std::vector<nvinfer1::Dims> output_dims; // and one output
+	std::vector<void*> buffers(mEngine->getNbBindings()); // buffers for input and output data
+	for (size_t i = 0; i < mEngine->getNbBindings(); ++i) {
+		auto bindDim = mEngine->getBindingDimensions(i);
+		auto binding_size = getSizeByDim(bindDim) * batch_size * sizeof(float);
+		cudaMalloc(&buffers[i], binding_size);
+		//cudaMemset(&buffers[i], 0, binding_size);
+		if (mEngine->bindingIsInput(i)) {
+			input_dims.emplace_back(mEngine->getBindingDimensions(i));
+		}
+		else {
+			output_dims.emplace_back(mEngine->getBindingDimensions(i));
+		}
+	}
+	if (input_dims.empty() || output_dims.empty()) {
+		std::cerr << "Expect at least one input and one output for network\n";
+		return -1;
+	}
+
+	preprocessImage(image_path, (float*)buffers[0], input_dims[0]);
+	// inference
+	mContext->enqueue(batch_size, buffers.data(), 0, nullptr);
+	// postprocess results
+	postprocessResults((float*)buffers[1], output_dims[0], batch_size, out_String);
+
+	for (void* buf : buffers)
+	{
+		cudaFree(buf);
+	}
+	mEngine.reset();
+	input_dims.clear();
+	output_dims.clear();
+	buffers.clear();
+
+	return 0;
+}
